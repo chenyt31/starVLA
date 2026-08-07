@@ -41,6 +41,10 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import add_discretized_state_to_instruction, merge_framework_config
 from starVLA.model.modules.action_model.MLP_ActionHeader import get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.training.trainer_utils.action_loss import (
+    build_action_valid_mask,
+    compute_masked_action_l1_loss,
+)
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
@@ -129,11 +133,26 @@ class Qwenvl_OFT(baseframework):
         self.chunk_len = self.action_horizon
         # self.hidden_dim = config.framework.action_model.action_hidden_dim
 
+        robot_type = getattr(
+            getattr(getattr(self.config, "datasets", None), "vla_data", None),
+            "robot_type",
+            None,
+        )
+        action_dim = int(self.config.framework.action_model.action_dim)
+        self._unit_quaternion_slices: Tuple[Tuple[int, int], ...] = (
+            ((3, 7), (21, 25))
+            if robot_type == "EgoS2_Adamu" and action_dim == 36
+            else ()
+        )
+
         self.action_token = "🔍"  # TODO also can add spacail token to Qwen, but too complex
         self.action_token_id = self.qwen_vl_interface.processor.tokenizer("🔍", add_special_tokens=False)["input_ids"][0]
 
         # L1 loss
-        self.l1_loss = nn.L1Loss()
+        # Keep the unreduced loss so the trainer can identify the physical
+        # dataset sample behind a spike.  The scalar mean remains the training
+        # objective used by previous checkpoints.
+        self.l1_loss = nn.L1Loss(reduction="none")
 
     def forward(
         self,
@@ -198,17 +217,39 @@ class Qwenvl_OFT(baseframework):
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+            pred_actions = self._project_unit_quaternions(
+                pred_actions, self._unit_quaternion_slices
+            )
 
             # Label alignment: take the last chunk_len segment
             actions = torch.tensor(
                 np.array(actions), device=pred_actions.device, dtype=pred_actions.dtype
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+            actions_target = self._project_unit_quaternions(
+                actions_target, self._unit_quaternion_slices
+            )
 
-            # Compute L1 loss
-            action_loss = self.l1_loss(pred_actions, actions_target)
+            # Compute L1 loss only over real action positions.  The dataset
+            # intentionally keeps true pause/hold actions; the mask excludes
+            # only synthetic positions past the episode boundary.
+            action_valid_mask = build_action_valid_mask(
+                examples,
+                horizon=self.action_horizon,
+                device=pred_actions.device,
+                dtype=pred_actions.dtype,
+            )
+            action_loss_per_sample = compute_masked_action_l1_loss(
+                pred_actions,
+                actions_target,
+                action_valid_mask,
+            )
+            action_loss = action_loss_per_sample.mean()
 
-        return {"action_loss": action_loss}
+        return {
+            "action_loss": action_loss,
+            "action_loss_per_sample": action_loss_per_sample,
+        }
 
     @torch.inference_mode()
     def predict_action(
@@ -271,9 +312,51 @@ class Qwenvl_OFT(baseframework):
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+            pred_actions = self._project_unit_quaternions(
+                pred_actions, self._unit_quaternion_slices
+            )
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
+
+    @staticmethod
+    def _project_unit_quaternions(
+        actions: torch.Tensor,
+        slices: Tuple[Tuple[int, int], ...],
+    ) -> torch.Tensor:
+        """Project configured quaternion action slices onto canonical unit quaternions.
+
+        Quaternion components are one geometric object: normalizing each component
+        independently destroys the rotation representation.  We therefore apply a
+        joint L2 normalization, use identity for near-zero predictions, and choose
+        the canonical hemisphere so equivalent ``q``/``-q`` labels agree.
+        """
+        if not slices:
+            return actions
+
+        projected = actions
+        for start, end in slices:
+            q = projected[..., start:end]
+            eps = torch.finfo(q.dtype).eps
+            norm = torch.linalg.vector_norm(q, dim=-1, keepdim=True)
+
+            q = q / norm.clamp_min(eps)
+
+            identity = torch.zeros_like(q)
+            identity[..., 0] = 1.0
+            q = torch.where(norm > eps, q, identity)
+
+            sign = torch.where(
+                q[..., :1] < 0,
+                -torch.ones_like(q[..., :1]),
+                torch.ones_like(q[..., :1]),
+            )
+            q = q * sign
+            projected = torch.cat(
+                (projected[..., :start], q, projected[..., end:]), dim=-1
+            )
+
+        return projected
 
     def _gather_action_token_embeddings(
         self,

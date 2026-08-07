@@ -291,6 +291,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        action_valid_mask: torch.Tensor = None,
+        return_per_sample: bool = False,
     ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
@@ -342,8 +344,24 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         pred = self.action_decoder(model_output)
         pred_actions = pred[:, -actions.shape[1] :]
 
-        # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
+        # Slice out only the action portion of pred and target.  Boundary
+        # padding is excluded by time-step mask; real stationary actions stay
+        # valid because their mask entries are one.
+        per_step_loss = ((pred_actions - velocity) ** 2).mean(dim=-1)
+        if action_valid_mask is None:
+            action_valid_mask = torch.ones(
+                actions.shape[:2], device=actions.device, dtype=per_step_loss.dtype
+            )
+        if action_valid_mask.shape != actions.shape[:2]:
+            raise ValueError(
+                "action_valid_mask must have shape [B, H]: "
+                f"got {action_valid_mask.shape} for actions {actions.shape}"
+            )
+        valid = action_valid_mask.to(dtype=per_step_loss.dtype)
+        loss_per_sample = (per_step_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+        loss = loss_per_sample.mean()
+        if return_per_sample:
+            return loss, loss_per_sample
         return loss
 
     @torch.no_grad()

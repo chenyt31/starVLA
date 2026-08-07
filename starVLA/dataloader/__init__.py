@@ -36,11 +36,23 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
     if dataset_py == "lerobot_datasets":
-        from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
+        from starVLA.dataloader.lerobot_datasets import (
+            OverfitSampler,
+            collate_fn,
+            get_vla_dataset,
+        )
         vla_dataset_cfg = cfg.datasets.vla_data
+
+        overfit_cfg = vla_dataset_cfg.get("overfit", {}) or {}
+        trainer_overfit_cfg = cfg.trainer.get("overfit", {}) if hasattr(cfg, "trainer") else {}
+        if not bool(overfit_cfg.get("enabled", False)) and bool(trainer_overfit_cfg.get("enabled", False)):
+            overfit_cfg = trainer_overfit_cfg
+        overfit_enabled = bool(overfit_cfg.get("enabled", False))
+        dataset_mode = "eval" if overfit_enabled else "train"
 
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
+            mode=dataset_mode,
             balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
         )
@@ -52,6 +64,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             "pin_memory": bool(vla_dataset_cfg.get("pin_memory", True)),
             # shuffle=True
         }
+        if overfit_enabled:
+            requested_samples = int(overfit_cfg.get("num_samples", 8))
+            dataloader_kwargs["sampler"] = OverfitSampler(
+                dataset_size=len(vla_dataset),
+                num_samples=requested_samples,
+            )
         if num_workers > 0:
             dataloader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             dataloader_kwargs["prefetch_factor"] = int(vla_dataset_cfg.get("prefetch_factor", 2))

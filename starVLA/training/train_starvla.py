@@ -12,6 +12,7 @@ Conventions:
 
 # Standard Library
 import argparse
+import importlib.util
 import json
 import os
 import time
@@ -45,10 +46,17 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
+from starVLA.training.trainer_utils.loss_diagnostics import LossSpikeTracker, OverfitAnalyzer
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+if importlib.util.find_spec("deepspeed") is None:
+    # DeepSpeed is an optional acceleration path.  Keep single-GPU training
+    # usable in the lightweight CUDA environment used by EgoS2 smoke tests.
+    deepspeed_plugin = None
+    accelerator = Accelerator()
+else:
+    deepspeed_plugin = DeepSpeedPlugin()
+    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
 accelerator.print(accelerator.state)
 
 # Sane Defaults
@@ -124,7 +132,17 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self.micro_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+
+        self.loss_spike_tracker = LossSpikeTracker(
+            self.config.output_dir,
+            self.config.trainer.get("loss_spike", None),
+        )
+        self.overfit_analyzer = OverfitAnalyzer(
+            self.config.output_dir,
+            self.config.trainer.get("overfit", None),
+        )
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -153,6 +171,9 @@ class VLATrainer(TrainerUtils):
             self.optimizer,
             self.vla_train_dataloader,
         )
+
+        # Keep one clean gradient buffer before the first accumulation window.
+        self.optimizer.zero_grad()
 
         self._init_wandb()
 
@@ -343,7 +364,8 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
+            optimizer_stepped = self.accelerator.sync_gradients
+            if optimizer_stepped:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
@@ -355,14 +377,15 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            if optimizer_stepped and self.completed_steps > 0 and self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            if optimizer_stepped:
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if optimizer_stepped and self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -401,17 +424,30 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
+        self.micro_steps += 1
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
                 total_loss = action_loss
 
+            per_sample_losses = output_dict.get("action_loss_per_sample")
+            diagnostic_metrics = self.loss_spike_tracker.update(
+                step=self.completed_steps + 1,
+                micro_step=self.micro_steps,
+                batch=batch_vla,
+                per_sample_losses=per_sample_losses,
+            )
+            self.overfit_analyzer.update(
+                step=self.completed_steps + 1,
+                micro_step=self.micro_steps,
+                batch=batch_vla,
+                per_sample_losses=per_sample_losses,
+            )
+
             self.accelerator.backward(total_loss)
 
-            if self.config.trainer.gradient_clipping is not None:
+            if self.config.trainer.gradient_clipping is not None and self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
@@ -422,10 +458,13 @@ class VLATrainer(TrainerUtils):
             # at min_lr well before max_train_steps is reached.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+                self.optimizer.zero_grad()
 
-        return {
+        metrics = {
             "action_dit_loss": action_loss.item(),
         }
+        metrics.update(diagnostic_metrics)
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
@@ -449,6 +488,8 @@ class VLATrainer(TrainerUtils):
                 wandb.finish()
             except Exception:
                 pass
+
+        self.overfit_analyzer.finalize()
 
         self.accelerator.wait_for_everyone()
 

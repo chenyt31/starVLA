@@ -96,7 +96,7 @@ class RotationTransform:
 
 
 class Normalizer:
-    valid_modes = ["q99", "mean_std", "min_max", "binary"]
+    valid_modes = ["identity", "q99", "mean_std", "min_max", "binary"]
 
     def __init__(self, mode: str, statistics: dict, binary_threshold: float = 0.5):
         self.mode = mode
@@ -111,7 +111,9 @@ class Normalizer:
         ), f"Unexpected input type: {type(x)}. Expected type: {torch.Tensor}"
 
         # Normalize the tensor
-        if self.mode == "q99":
+        if self.mode == "identity":
+            return x
+        elif self.mode == "q99":
             # Range of q99 is [-1, 1]
             q01 = self.statistics["q01"].to(x.dtype)
             q99 = self.statistics["q99"].to(x.dtype)
@@ -195,7 +197,9 @@ class Normalizer:
         assert isinstance(
             x, torch.Tensor
         ), f"Unexpected input type: {type(x)}. Expected type: {torch.Tensor}"
-        if self.mode == "q99":
+        if self.mode == "identity":
+            return x
+        elif self.mode == "q99":
             q01 = self.statistics["q01"].to(x.dtype)
             q99 = self.statistics["q99"].to(x.dtype)
             return (x + 1) / 2 * (q99 - q01) + q01
@@ -375,6 +379,8 @@ class StateActionTransform(InvertibleModalityTransform):
                     assert len(normalization_statistics["q01"]) == len(
                         normalization_statistics["q99"]
                     ), f"q01 and q99 statistics must have the same length, but got {normalization_statistics['q01']} and {normalization_statistics['q99']}"
+                elif normalization_mode == "identity":
+                    pass
                 elif normalization_mode == "binary":
                     assert (
                         len(normalization_statistics) == 1

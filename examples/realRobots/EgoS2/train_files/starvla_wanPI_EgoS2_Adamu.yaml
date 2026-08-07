@@ -1,0 +1,83 @@
+# WanPI variant of the EgoS2 36-D training contract.
+# Override framework.world_model.base_wm if the Wan2.2 checkpoint is mounted
+# elsewhere.  The default follows the project canonical weight root.
+run_id: starvla_wanPI_EgoS2_Adamu_smoke
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starVLA_EgoS2
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: WanPI
+  freeze_world_model: true
+  world_model:
+    base_wm: /share/yangtao/EgoS2/weights/Wan2.2-TI2V-5B-Diffusers
+    extract_layers: [-1]
+  qwenvl:
+    base_vlm: /share/yangtao/EgoS2/weights/Wan2.2-TI2V-5B-Diffusers
+  action_model:
+    action_model_type: LayerwiseFM
+    action_dim: 36
+    state_dim: 36
+    action_horizon: 8
+    repeated_diffusion_steps: 2
+    num_inference_timesteps: 4
+    diffusion_model_cfg:
+      cross_attention_dim: 1024
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /share/yangtao/EgoS2/visualizations/20260807T081846Z_adamu_open_state36_validmask
+    data_mix: EgoS2_Adamu_Open
+    robot_type: EgoS2_Adamu
+    lerobot_version: v2.0
+    action_type: EgoS2_delta_eef_abs_hand
+    action_mode: abs
+    per_device_batch_size: 1
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: pyav
+    mirror_augmentation:
+      enabled: true
+      probability: 0.5
+      seed: 42
+    overfit:
+      enabled: false
+      num_samples: 8
+
+trainer:
+  max_train_steps: 1000
+  num_warmup_steps: 50
+  save_interval: 200
+  eval_interval: 500
+  learning_rate:
+    base: 2.0e-05
+    wm_projector: 1.0e-04
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  gradient_clipping: 1.0
+  logging_frequency: 10
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt
+  loss_spike:
+    enabled: true
+    warmup_steps: 10
+    ratio_threshold: 4.0
+    ema_decay: 0.98
+    top_k: 8
+  overfit:
+    enabled: false
+    log_every: 1
+    target_ratio: 0.1

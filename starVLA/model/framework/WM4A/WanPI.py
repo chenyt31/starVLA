@@ -33,6 +33,7 @@ import torch
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.training.trainer_utils import initialize_overwatch
+from starVLA.training.trainer_utils.action_loss import build_action_valid_mask
 
 logger = initialize_overwatch(__name__)
 
@@ -92,6 +93,10 @@ class WanPIDefaultConfig:
         }
     )
 
+    # Training the 5B Wan DiT is optional.  Freezing it leaves the projector
+    # and action head trainable and is the safer first pass for a new dataset.
+    freeze_world_model: bool = False
+
 
 @FRAMEWORK_REGISTRY.register("WanPI")
 class Wan_PI(baseframework):
@@ -119,7 +124,23 @@ class Wan_PI(baseframework):
 
         # Project world model features to action model's cross-attention dim
         cross_attn_dim = self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim
+        if cross_attn_dim is None:
+            cross_attn_dim = wm_hidden
+            self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = wm_hidden
         self.wm_projector = torch.nn.Linear(wm_hidden, cross_attn_dim)
+
+        # Layerwise DiT consumes one encoder sequence per action-head block.
+        # Wan2.2 has 30 transformer blocks; leaving the generic 36-layer
+        # fallback here causes an index error at block 30.
+        self.config.framework.action_model.diffusion_model_cfg.num_layers = num_blocks
+
+        if bool(self.config.framework.get("freeze_world_model", False)):
+            self.backbone.requires_grad_(False)
+        else:
+            # These two encoders are already run under no_grad in Wan2.py and
+            # should not create optimizer parameter groups accidentally.
+            self.backbone.text_encoder.requires_grad_(False)
+            self.backbone.vae.requires_grad_(False)
 
         # Sync vl_hidden_dim so LayerwiseFM action head stays consistent
         self.config.framework.qwenvl.vl_hidden_dim = cross_attn_dim
@@ -154,9 +175,15 @@ class Wan_PI(baseframework):
 
     def _capture_all_hook(self, module, input, output):
         if isinstance(output, tuple):
-            self._all_hidden_states.append(output[0])
-        else:
-            self._all_hidden_states.append(output)
+            output = output[0]
+        if output.dim() == 5:
+            batch, channels, time, height, width = output.shape
+            output = output.permute(0, 2, 3, 4, 1).reshape(
+                batch, time * height * width, channels
+            )
+        if output.dim() != 3:
+            raise ValueError(f"Unexpected Wan transformer block output shape: {tuple(output.shape)}")
+        self._all_hidden_states.append(output)
 
     def forward(self, examples: List[dict] = None, **kwargs) -> Tuple:
         batch_images = [example["image"] for example in examples]
@@ -171,16 +198,25 @@ class Wan_PI(baseframework):
             self._all_hidden_states.clear()
             wm_outputs = self.backbone(
                 **wm_inputs,
+                _skip_feature_collection=True,
                 output_hidden_states=True,
                 return_dict=True,
             )
             vl_embs_list = list(self._all_hidden_states)
             vl_embs_list = [self.wm_projector(h) for h in vl_embs_list]
+            if not vl_embs_list:
+                raise RuntimeError("WanPI did not capture any Wan transformer block features")
             base_hidden = vl_embs_list[-1]
 
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(np.array(actions), device=base_hidden.device, dtype=base_hidden.dtype)
             actions_target = actions[:, -self.action_horizon :, :]
+            action_valid_mask = build_action_valid_mask(
+                examples,
+                horizon=self.action_horizon,
+                device=base_hidden.device,
+                dtype=base_hidden.dtype,
+            )
 
             repeated_diffusion_steps = (
                 self.config.framework.action_model.get("repeated_diffusion_steps", 2)
@@ -188,6 +224,7 @@ class Wan_PI(baseframework):
                 else 2
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
+            action_valid_mask_repeated = action_valid_mask.repeat(repeated_diffusion_steps, 1)
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
 
             state_repeated = None
@@ -195,9 +232,22 @@ class Wan_PI(baseframework):
                 state = torch.tensor(np.array(state), device=base_hidden.device, dtype=base_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(vl_embs_list_repeated, actions_target_repeated, state_repeated)
+            action_loss, repeated_loss_per_sample = self.action_model(
+                vl_embs_list_repeated,
+                actions_target_repeated,
+                state_repeated,
+                action_valid_mask=action_valid_mask_repeated,
+                return_per_sample=True,
+            )
+            action_loss_per_sample = repeated_loss_per_sample.reshape(
+                repeated_diffusion_steps,
+                len(examples),
+            ).mean(dim=0)
 
-        return {"action_loss": action_loss}
+        return {
+            "action_loss": action_loss,
+            "action_loss_per_sample": action_loss_per_sample,
+        }
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict], **kwargs) -> np.ndarray:
@@ -216,11 +266,15 @@ class Wan_PI(baseframework):
             self._all_hidden_states.clear()
             wm_outputs = self.backbone(
                 **wm_inputs,
+                _skip_feature_collection=True,
                 output_hidden_states=True,
                 return_dict=True,
             )
             vl_embs_list = list(self._all_hidden_states)
             vl_embs_list = [self.wm_projector(h) for h in vl_embs_list]
+
+            if not vl_embs_list:
+                raise RuntimeError("WanPI did not capture any Wan transformer block features")
 
         state = (
             torch.from_numpy(np.array(state)).to(vl_embs_list[-1].device, dtype=vl_embs_list[-1].dtype)

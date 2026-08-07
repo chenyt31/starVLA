@@ -1,0 +1,87 @@
+run_id: starvla_qwenOFT_EgoS2_Adamu_smoke
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starVLA_EgoS2
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /sharedata/pretrained/mllm/Qwen/Qwen3.5-0.8B
+    attn_implementation: sdpa
+  action_model:
+    action_model_type: MLP
+    action_dim: 36
+    state_dim: 36
+    action_horizon: 8
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    # Parent of the generated `lerobot_v21` dataset. Override this path for
+    # another EgoS2 run with --datasets.vla_data.data_root_dir.
+    data_root_dir: /share/yangtao/EgoS2/visualizations/20260807T081846Z_adamu_open_state36_validmask
+    data_mix: EgoS2_Adamu_Open
+    robot_type: EgoS2_Adamu
+    lerobot_version: v2.0
+    action_type: EgoS2_delta_eef_abs_hand
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 1
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: pyav
+    mirror_augmentation:
+      enabled: true
+      probability: 0.5
+      seed: 42
+    overfit:
+      enabled: false
+      num_samples: 8
+
+trainer:
+  max_train_steps: 1000
+  num_warmup_steps: 50
+  save_interval: 200
+  eval_interval: 500
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt
+
+  loss_spike:
+    enabled: true
+    warmup_steps: 10
+    ratio_threshold: 4.0
+    ema_decay: 0.98
+    top_k: 8
+
+  overfit:
+    enabled: false
+    log_every: 1
+    target_ratio: 0.1

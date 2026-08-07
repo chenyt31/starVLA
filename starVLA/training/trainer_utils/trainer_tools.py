@@ -341,6 +341,13 @@ class TrainerUtils:
         if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
             dataloader.sampler.set_epoch(epoch_counter)
 
+        # Our LeRobot datasets use the epoch in their deterministic sampling
+        # and mirror-augmentation keys.  RandomSampler does not expose
+        # set_epoch, so propagate it through the dataloader dataset as well.
+        dataset = getattr(dataloader, "dataset", None)
+        if dataset is not None and callable(getattr(dataset, "set_epoch", None)):
+            dataset.set_epoch(epoch_counter)
+
         # 3. create new iterator
         return iter(dataloader), epoch_counter
 

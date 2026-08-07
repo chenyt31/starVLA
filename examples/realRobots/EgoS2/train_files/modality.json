@@ -1,0 +1,96 @@
+{
+  "state": {
+    "left_eef_position": {
+      "start": 0,
+      "end": 3,
+      "original_key": "observation.state",
+      "absolute": true
+    },
+    "left_eef_quaternion": {
+      "start": 3,
+      "end": 7,
+      "original_key": "observation.state",
+      "absolute": true,
+      "rotation_type": "quaternion",
+      "padding": "first_last"
+    },
+    "left_hand": {
+      "start": 7,
+      "end": 18,
+      "original_key": "observation.state",
+      "absolute": true
+    },
+    "right_eef_position": {
+      "start": 18,
+      "end": 21,
+      "original_key": "observation.state",
+      "absolute": true
+    },
+    "right_eef_quaternion": {
+      "start": 21,
+      "end": 25,
+      "original_key": "observation.state",
+      "absolute": true,
+      "rotation_type": "quaternion",
+      "padding": "first_last"
+    },
+    "right_hand": {
+      "start": 25,
+      "end": 36,
+      "original_key": "observation.state",
+      "absolute": true
+    }
+  },
+  "action": {
+    "left_eef_delta_position": {
+      "start": 0,
+      "end": 3,
+      "original_key": "action",
+      "absolute": false
+    },
+    "left_eef_delta_quaternion": {
+      "start": 3,
+      "end": 7,
+      "original_key": "action",
+      "absolute": false,
+      "rotation_type": "quaternion",
+      "padding": "first_last"
+    },
+    "left_hand": {
+      "start": 7,
+      "end": 18,
+      "original_key": "action",
+      "absolute": true
+    },
+    "right_eef_delta_position": {
+      "start": 18,
+      "end": 21,
+      "original_key": "action",
+      "absolute": false
+    },
+    "right_eef_delta_quaternion": {
+      "start": 21,
+      "end": 25,
+      "original_key": "action",
+      "absolute": false,
+      "rotation_type": "quaternion",
+      "padding": "first_last"
+    },
+    "right_hand": {
+      "start": 25,
+      "end": 36,
+      "original_key": "action",
+      "absolute": true
+    }
+  },
+  "video": {
+    "camera": {
+      "original_key": "observation.images.camera"
+    }
+  },
+  "annotation": {
+    "human.task_description": {
+      "original_key": "task_index"
+    }
+  }
+}

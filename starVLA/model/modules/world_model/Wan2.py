@@ -303,6 +303,7 @@ class _Wan2_Interface(nn.Module):
         Returns an output object with .hidden_states for compatibility.
         """
         kwargs.pop("_is_wm_input", False) # pop internal routing flags from kwargs to avoid passing them downstream
+        skip_feature_collection = kwargs.pop("_skip_feature_collection", False)
         kwargs.pop("output_hidden_states", False)
         kwargs.pop("return_dict", True)
         kwargs.pop("output_attentions", None)
@@ -315,6 +316,18 @@ class _Wan2_Interface(nn.Module):
                 timestep=kwargs["timestep"],
                 encoder_hidden_states=kwargs["encoder_hidden_states"],
             )
+
+        if skip_feature_collection:
+            # WanPI installs its own hooks for every transformer block.  Avoid
+            # materialising the default extract-layer features a second time.
+            self._intermediate_features.clear()
+
+            class _WMOutput:
+                def __init__(self, hidden_states_tuple, loss=None):
+                    self.hidden_states = hidden_states_tuple
+                    self.loss = loss
+
+            return _WMOutput(hidden_states_tuple=tuple())
 
         # Collect features from hooks
         # WanTransformer3DModel blocks output [B, seq_len, hidden_dim] (already flattened)

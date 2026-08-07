@@ -75,9 +75,30 @@ def _auto_import_framework_modules() -> None:
             for _, sub_name, _ in pkgutil.iter_modules([str(sub_dir)]):
                 if sub_name.startswith("_"):
                     continue
-                importlib.import_module(f"starVLA.model.framework.{module_name}.{sub_name}")
+                module_path = f"starVLA.model.framework.{module_name}.{sub_name}"
+                try:
+                    importlib.import_module(module_path)
+                except ImportError as error:
+                    # Framework discovery is global, but dependencies are not:
+                    # an unused optional framework must not prevent the
+                    # requested framework from being registered. build_framework
+                    # still raises clearly if the requested framework itself is
+                    # unavailable.
+                    logger.warning(
+                        "Skipping optional framework module %s: %s",
+                        module_path,
+                        error,
+                    )
         else:
-            importlib.import_module(f"starVLA.model.framework.{module_name}")
+            module_path = f"starVLA.model.framework.{module_name}"
+            try:
+                importlib.import_module(module_path)
+            except ImportError as error:
+                logger.warning(
+                    "Skipping optional framework module %s: %s",
+                    module_path,
+                    error,
+                )
 
     _FRAMEWORKS_IMPORTED = True
 

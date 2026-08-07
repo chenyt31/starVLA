@@ -7,6 +7,7 @@
 import logging
 from pathlib import Path
 from typing import Sequence
+from torch.utils.data import Sampler
 from omegaconf import OmegaConf
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
@@ -21,12 +22,33 @@ logger = logging.getLogger(__name__)
 def collate_fn(batch):
     return batch
 
+
+class OverfitSampler(Sampler[int]):
+    """Yield the first logical dataset indices once per epoch."""
+
+    def __init__(self, dataset_size: int, num_samples: int):
+        if dataset_size <= 0:
+            raise ValueError("Cannot overfit an empty dataset")
+        self.num_samples = min(int(num_samples), int(dataset_size))
+        if self.num_samples <= 0:
+            raise ValueError(f"num_samples must be positive, got {num_samples}")
+
+    def __iter__(self):
+        return iter(range(self.num_samples))
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        del epoch
+
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
     robot_type: str,
     delete_pause_frame: bool = False,
     data_cfg: dict | None = None,
+    mode: str = "train",
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -62,6 +84,7 @@ def make_LeRobotSingleDataset(
             delete_pause_frame=delete_pause_frame,
             data_cfg=data_cfg,
             dataset_name=data_name,
+            mode=mode,
         )
 
     return LeRobotSingleDataset(
@@ -72,6 +95,7 @@ def make_LeRobotSingleDataset(
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
+        mode=mode,
     )
 
 def get_vla_dataset(
@@ -102,7 +126,19 @@ def get_vla_dataset(
 
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
-        dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg), d_weight))
+        dataset_mixture.append(
+            (
+                make_LeRobotSingleDataset(
+                    Path(data_root_dir),
+                    d_name,
+                    robot_type,
+                    delete_pause_frame=delete_pause_frame,
+                    data_cfg=data_cfg,
+                    mode=mode,
+                ),
+                d_weight,
+            )
+        )
 
     return LeRobotMixtureDataset(
         dataset_mixture,

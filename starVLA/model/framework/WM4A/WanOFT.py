@@ -35,6 +35,10 @@ import torch.nn as nn
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.training.trainer_utils import initialize_overwatch
+from starVLA.training.trainer_utils.action_loss import (
+    build_action_valid_mask,
+    compute_masked_action_l1_loss,
+)
 
 logger = initialize_overwatch(__name__)
 
@@ -147,9 +151,23 @@ class Wan_OFT(baseframework):
             actions = torch.tensor(np.array(actions), device=pred_actions.device, dtype=pred_actions.dtype)
             actions_target = actions[:, -self.action_horizon :, :]
 
-            action_loss = self.l1_loss(pred_actions, actions_target)
+            action_valid_mask = build_action_valid_mask(
+                examples,
+                horizon=self.action_horizon,
+                device=pred_actions.device,
+                dtype=pred_actions.dtype,
+            )
+            action_loss_per_sample = compute_masked_action_l1_loss(
+                pred_actions,
+                actions_target,
+                action_valid_mask,
+            )
+            action_loss = action_loss_per_sample.mean()
 
-        return {"action_loss": action_loss}
+        return {
+            "action_loss": action_loss,
+            "action_loss_per_sample": action_loss_per_sample,
+        }
 
     @torch.inference_mode()
     def predict_action(self, examples: List[dict], **kwargs) -> np.ndarray:

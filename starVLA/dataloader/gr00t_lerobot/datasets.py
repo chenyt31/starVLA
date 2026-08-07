@@ -51,6 +51,10 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+from starVLA.dataloader.gr00t_lerobot.augmentations import (
+    deterministic_mirror_coin,
+    mirror_egos2_sample,
+)
 
 from functools import partial
 from typing import Tuple, List
@@ -71,6 +75,26 @@ EPSILON = 5e-4
 #  LeRobot v3.0 dataset file names 
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
+
+
+def compute_action_valid_mask(
+    *,
+    base_index: int,
+    trajectory_length: int,
+    action_indices: Sequence[int],
+) -> np.ndarray:
+    """Return which requested action-horizon positions are real frames.
+
+    The dataset keeps terminal/paused source frames as valid data.  This mask
+    only marks positions created by reading past an episode boundary, so a
+    genuine stationary action is never discarded just because it is small.
+    """
+
+    offsets = np.asarray(action_indices, dtype=np.int64).reshape(-1)
+    if offsets.size == 0:
+        raise ValueError("action_indices must contain at least one offset")
+    indices = int(base_index) + offsets
+    return ((indices >= 0) & (indices < int(trajectory_length))).astype(np.float32)
 
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
@@ -161,9 +185,30 @@ def _normalize_action_mode_state_map(action_mode_state_map: dict[str, str] | Non
 
 def _build_stats_cache_config(
     action_mode: str,
+    parquet_paths: Sequence[Path] | None = None,
 ) -> dict:
+    """Build a cache key that changes when the source parquet data changes."""
+
+    source_signature = []
+    for parquet_path in sorted(parquet_paths or []):
+        try:
+            stat = parquet_path.stat()
+        except FileNotFoundError:
+            continue
+        source_signature.append(
+            {
+                "path": parquet_path.name,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
     return {
         "mode": action_mode,
+        # Horizon statistics ignore synthetic episode-boundary padding.  Keep
+        # this in the cache key so older caches are rebuilt after that policy
+        # changes.
+        "valid_action_horizon_only": True,
+        "source_signature": source_signature,
     }
 
 
@@ -352,8 +397,12 @@ def _get_action_col_slices(
         state_col = state_cfg.original_key or state_subkey
         action_slice = (action_cfg.start, action_cfg.end)
         state_slice = (state_cfg.start, state_cfg.end)
-        action_padding = "first_last" if action_cfg.absolute else "zero"
-        state_padding = "first_last" if state_cfg.absolute else "zero"
+        action_padding = action_cfg.padding or (
+            "first_last" if action_cfg.absolute else "zero"
+        )
+        state_padding = state_cfg.padding or (
+            "first_last" if state_cfg.absolute else "zero"
+        )
         action_col_slices.setdefault(action_col, []).append(
             (action_slice, state_col, state_slice, action_padding, state_padding)
         )
@@ -428,6 +477,7 @@ def calculate_delta_action_statistics(
                 prepared_slices.append((a_slice, state_part_full, state_padding))
             for base_index in range(trajectory_length):
                 action_steps = np.array(action_indices) + base_index
+                valid_action_positions = (action_steps >= 0) & (action_steps < trajectory_length)
                 action_chunk_full = _get_chunk(action_matrix, action_steps, action_padding_ref)
 
                 for a_slice, state_part_full, state_padding in prepared_slices:
@@ -442,7 +492,9 @@ def calculate_delta_action_statistics(
                     out[0] = action_part_chunk[0] - state_chunk[0]
                     action_chunk_full[:, a_slice[0] : a_slice[1]] = out
 
-                accum[action_col].append(action_chunk_full)
+                # Do not let zero/hold-last values synthesized past the
+                # episode boundary alter action normalization statistics.
+                accum[action_col].append(action_chunk_full[valid_action_positions])
 
     delta_stats = copy.deepcopy(base_stats)
     for action_col, series_list in accum.items():
@@ -526,6 +578,7 @@ def calculate_rel_action_statistics(
                 prepared_slices.append((a_slice, state_part_full, state_padding))
             for base_index in range(trajectory_length):
                 action_steps = np.array(action_indices) + base_index
+                valid_action_positions = (action_steps >= 0) & (action_steps < trajectory_length)
                 action_chunk_full = _get_chunk(action_matrix, action_steps, action_padding_ref)
 
                 for a_slice, state_part_full, state_padding in prepared_slices:
@@ -537,7 +590,7 @@ def calculate_rel_action_statistics(
                     out = action_part_chunk - state_chunk[0]
                     action_chunk_full[:, a_slice[0] : a_slice[1]] = out
 
-                accum[action_col].append(action_chunk_full)
+                accum[action_col].append(action_chunk_full[valid_action_positions])
 
     rel_stats = copy.deepcopy(base_stats)
     for action_col, series_list in accum.items():
@@ -577,6 +630,7 @@ class LeRobotSingleDataset(Dataset):
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
         data_cfg = None,
+        mode: str = "train",
         **kwargs,
     ):
         """
@@ -593,6 +647,7 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
+        self.mode = str(mode)
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
@@ -603,6 +658,28 @@ class LeRobotSingleDataset(Dataset):
         self._action_mode_apply_keys = None
 
         self.delete_pause_frame = delete_pause_frame
+
+        mirror_cfg = (data_cfg.get("mirror_augmentation", {}) if data_cfg else {}) or {}
+        overfit_cfg = (data_cfg.get("overfit", {}) if data_cfg else {}) or {}
+        overfit_mirror_enabled = bool(
+            overfit_cfg.get("enabled", False)
+            and overfit_cfg.get("apply_train_augmentations", False)
+        )
+        # Keep overfit sampling in ``eval`` mode so the logical indices map to
+        # the same physical episode/step on every epoch, while allowing an
+        # explicit opt-in to apply train-time mirror augmentation to those
+        # fixed samples.  Without this split, switching the whole mixture to
+        # train mode would resample a different physical step every epoch.
+        self.mirror_enabled = bool(mirror_cfg.get("enabled", False)) and (
+            self.mode == "train"
+            or (self.mode == "eval" and overfit_mirror_enabled)
+        )
+        self.mirror_probability = float(mirror_cfg.get("probability", 0.5))
+        self.mirror_seed = int(mirror_cfg.get("seed", data_cfg.get("seed", 42) if data_cfg else 42))
+        if not 0.0 <= self.mirror_probability <= 1.0:
+            raise ValueError(
+                f"mirror_augmentation.probability must be in [0, 1], got {self.mirror_probability}"
+            )
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -765,6 +842,7 @@ class LeRobotSingleDataset(Dataset):
                     continuous = False
                 simplified_modality_meta[modality][subkey] = {
                     "absolute": le_state_action_meta[subkey].absolute,
+                    "padding": le_state_action_meta[subkey].padding,
                     "rotation_type": le_state_action_meta[subkey].rotation_type,
                     "shape": [
                         le_state_action_meta[subkey].end - le_state_action_meta[subkey].start
@@ -820,6 +898,11 @@ class LeRobotSingleDataset(Dataset):
         action_indices = list(action_cfg.delta_indices) if action_cfg else None
         state_indices = list(state_cfg.delta_indices) if state_cfg else None
 
+        parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+        parquet_files_filtered = [
+            pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
+        ]
+
         apply_keys = _normalize_action_mode_apply_keys(
             self.data_cfg.get("action_mode_apply_keys", None) if self.data_cfg else None,
             action_keys_full,
@@ -829,11 +912,8 @@ class LeRobotSingleDataset(Dataset):
         )
         stats_cache_config = _build_stats_cache_config(
             action_mode=action_mode,
+            parquet_paths=parquet_files_filtered,
         )
-        parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
-        parquet_files_filtered = [
-            pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
-        ]
 
         if is_main():
             le_statistics = _load_or_compute_statistics(
@@ -1349,6 +1429,46 @@ class LeRobotSingleDataset(Dataset):
         """
         self.epoch = epoch
 
+    def _state_names_for_mirroring(self) -> list[str] | None:
+        """Return names for the flat state vector used by EgoS2 mirroring."""
+
+        if "state.adamu_qpos" not in self.modality_keys.get("state", []):
+            return None
+        state_cfg = self.lerobot_modality_meta.state.get("adamu_qpos")
+        if state_cfg is None or state_cfg.original_key is None:
+            return None
+        feature = self.lerobot_info_meta.get("features", {}).get(state_cfg.original_key, {})
+        names = feature.get("names")
+        return list(names) if isinstance(names, list) else None
+
+    def _maybe_mirror_data(
+        self,
+        data: dict,
+        *,
+        sample_index: int | None,
+        trajectory_id: int | str,
+        base_index: int,
+    ) -> dict:
+        """Apply the configured deterministic mirror augmentation, if enabled."""
+
+        if not self.mirror_enabled:
+            data["_mirror_applied"] = False
+            return data
+
+        should_mirror = deterministic_mirror_coin(
+            self.mirror_probability,
+            seed=self.mirror_seed,
+            epoch=self.epoch,
+            sample_index=sample_index,
+            trajectory_id=trajectory_id,
+            base_index=base_index,
+        )
+        if not should_mirror:
+            data["_mirror_applied"] = False
+            return data
+
+        return mirror_egos2_sample(data, state_names=self._state_names_for_mirroring())
+
     def __len__(self) -> int:
         """Get the total number of data points in the dataset.
 
@@ -1372,11 +1492,23 @@ class LeRobotSingleDataset(Dataset):
             dict: The data for the step.
         """
         trajectory_id, base_index = self.all_steps[index]
-        raw_data = self.get_step_data(trajectory_id, base_index)
+        raw_data = self.get_step_data(trajectory_id, base_index, sample_index=index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(
+            data,
+            sample_index=index,
+            trajectory_id=trajectory_id,
+            base_index=base_index,
+        )
 
-    def _pack_sample(self, data: dict) -> dict:
+    def _pack_sample(
+        self,
+        data: dict,
+        *,
+        sample_index: int | None = None,
+        trajectory_id: int | str | None = None,
+        base_index: int | None = None,
+    ) -> dict:
         """Pack transformed modality data into training sample format."""
         step_images = []
         for video_key in self.modality_keys["video"]:
@@ -1390,11 +1522,48 @@ class LeRobotSingleDataset(Dataset):
             action.append(data[action_key])
         action = np.concatenate(action, axis=1).astype(np.float16)
 
+        if base_index is None:
+            action_valid_mask = np.ones(action.shape[0], dtype=np.float32)
+        else:
+            action_key = self.modality_keys["action"][0]
+            trajectory_index = self.get_trajectory_index(trajectory_id)
+            trajectory_length = int(self.trajectory_lengths[trajectory_index])
+            action_valid_mask = compute_action_valid_mask(
+                base_index=int(base_index),
+                trajectory_length=trajectory_length,
+                action_indices=self.delta_indices[action_key],
+            )
+            if len(action_valid_mask) != action.shape[0]:
+                raise ValueError(
+                    "action_valid_mask length does not match the packed action horizon: "
+                    f"mask={len(action_valid_mask)}, action={action.shape[0]}"
+                )
+
         sample = {
             "action": action,
+            # This mask describes episode-boundary padding only.  It must not
+            # be inferred from action magnitude because true pause/hold
+            # actions are valid supervision.
+            "action_valid_mask": action_valid_mask,
+            "action_valid_fraction": float(action_valid_mask.mean()),
+            "action_padding_count": int((action_valid_mask == 0).sum()),
             "image": step_images,
             "lang": language,
-            "robot_tag": self.tag
+            "robot_tag": self.tag,
+            # These fields are consumed by loss diagnostics and ignored by
+            # model frameworks.  Keep both a numeric index and a stable ID:
+            # mixture indices are sampling positions, while the ID identifies
+            # the physical episode/step that produced the sample.
+            "sample_index": None if sample_index is None else int(sample_index),
+            "dataset_name": self.dataset_name,
+            "trajectory_id": None if trajectory_id is None else int(trajectory_id),
+            "base_index": None if base_index is None else int(base_index),
+            "sample_id": (
+                f"{self.dataset_name}/episode_{int(trajectory_id):06d}/step_{int(base_index)}"
+                if trajectory_id is not None and base_index is not None
+                else f"{self.dataset_name}/sample_{sample_index}"
+            ),
+            "is_mirrored": bool(data.get("_mirror_applied", False)),
         }
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
@@ -1415,7 +1584,12 @@ class LeRobotSingleDataset(Dataset):
 
         return sample
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(
+        self,
+        trajectory_id: int,
+        base_index: int,
+        sample_index: int | None = None,
+    ) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
 
         Args:
@@ -1450,7 +1624,12 @@ class LeRobotSingleDataset(Dataset):
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         data = self._apply_action_mode(data)
-        return data
+        return self._maybe_mirror_data(
+            data,
+            sample_index=sample_index,
+            trajectory_id=trajectory_id,
+            base_index=base_index,
+        )
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
         """Get the data for a trajectory."""
@@ -1734,13 +1913,21 @@ class LeRobotSingleDataset(Dataset):
         # Get the state or action configuration
         state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
 
+        padding_strategy = state_or_action_cfg.padding
+        if padding_strategy is None:
+            padding_strategy = "first_last" if state_or_action_cfg.absolute else "zero"
+        if padding_strategy not in {"first_last", "zero"}:
+            raise ValueError(
+                f"Invalid padding strategy {padding_strategy!r} for "
+                f"{modality}.{key}; expected 'first_last' or 'zero'"
+            )
+
         # Pad the data
         return self.retrieve_data_and_pad(
             array=data_array,
             step_indices=step_indices,
             max_length=max_length,
-            padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
-            # padding_strategy="zero",           # HACK for realdata
+            padding_strategy=padding_strategy,
         )
 
     def get_language(
@@ -1990,7 +2177,12 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         absolute_indices = self.start_indices[trajectory_index] + step_indices
         return self.cached_frames[key][absolute_indices]
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(
+        self,
+        trajectory_id: int,
+        base_index: int,
+        sample_index: int | None = None,
+    ) -> dict:
         """Get the RAW data for a single step. No transforms are applied.
 
         Args:
@@ -2007,7 +2199,12 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
-        return data
+        return self._maybe_mirror_data(
+            data,
+            sample_index=sample_index,
+            trajectory_id=trajectory_id,
+            base_index=base_index,
+        )
 
     def set_transforms_metadata(self, metadata: DatasetMetadata):
         """Set the metadata for the transforms. This is useful for transforms that need to know the metadata, such as the normalization values."""
@@ -2314,6 +2511,8 @@ class LeRobotMixtureDataset(Dataset):
             epoch (int): The epoch to set.
         """
         self.epoch = epoch
+        for dataset in self.datasets:
+            dataset.set_epoch(epoch)
         # self.sampled_steps = self.sample_epoch()
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
@@ -2381,9 +2580,18 @@ class LeRobotMixtureDataset(Dataset):
                         break
                     index = random.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
+                raw_data = dataset.get_step_data(
+                    trajectory_id,
+                    step,
+                    sample_index=index,
+                )
                 data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
+                sample = dataset._pack_sample(
+                    data,
+                    sample_index=index,
+                    trajectory_id=trajectory_id,
+                    base_index=step,
+                )
                 
                 return sample
                 

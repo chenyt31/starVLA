@@ -66,6 +66,13 @@ class LeRobotStateActionMetadata(LeRobotModalityField):
         default=None, description="The type of rotation for the modality"
     )
     absolute: bool = Field(default=True, description="Whether the modality is absolute")
+    padding: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional out-of-range padding strategy. Supported values are "
+            "'zero' and 'first_last'; when omitted, it is inferred from absolute."
+        ),
+    )
     dtype: str = Field(
         default="float64",
         description="The data type of the modality. Defaults to float64.",
@@ -198,6 +205,10 @@ class VideoMetadata(BaseModel):
 
 class StateActionMetadata(BaseModel):
     absolute: bool = Field(..., description="Whether the state or action is absolute")
+    padding: Optional[str] = Field(
+        default=None,
+        description="Explicit out-of-range padding strategy, if configured",
+    )
     rotation_type: Optional[RotationType] = Field(None, description="Type of rotation, if any")
     shape: tuple[int, ...] = Field(..., description="Shape of the state or action")
     continuous: bool = Field(..., description="Whether the state or action is continuous")
