@@ -28,6 +28,11 @@ datasets:
     robot_type: EgoS2_Adamu
     lerobot_version: v2.0
     action_type: EgoS2_delta_eef_abs_hand
+    # The exported parquet already stores native EgoS2 actions:
+    # delta EEF pose + absolute hand qpos.  ``abs`` here means the dataloader
+    # must preserve those stored values (no second abs→delta conversion).
+    # Deployment must use pnd-humanoid's ``--action-mode native`` to decode
+    # the same contract against the measured current state.
     action_mode: abs
     sequential_step_sampling: false
     per_device_batch_size: 1
@@ -59,6 +64,12 @@ trainer:
   loss_scale:
     vla: 1.0
     vlm: 0.1
+  # Per-coordinate action L1 weights.  For EgoS2, each value applies to both
+  # arms: EEF position (3), relative quaternion (4), and hand qpos (11).
+  action_loss_weights:
+    eef_position: 1.0
+    eef_quaternion: 1.0
+    hand: 1.0
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 10

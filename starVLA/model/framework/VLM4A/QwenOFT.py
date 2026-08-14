@@ -138,6 +138,7 @@ class Qwenvl_OFT(baseframework):
             "robot_type",
             None,
         )
+        self.robot_type = robot_type
         action_dim = int(self.config.framework.action_model.action_dim)
         self._unit_quaternion_slices: Tuple[Tuple[int, int], ...] = (
             ((3, 7), (21, 25))
@@ -239,10 +240,24 @@ class Qwenvl_OFT(baseframework):
                 device=pred_actions.device,
                 dtype=pred_actions.dtype,
             )
+            dimension_weights = None
+            action_loss_weights = self.config.trainer.get("action_loss_weights", {}) or {}
+            if self.robot_type == "EgoS2_Adamu" and pred_actions.shape[-1] == 36:
+                position_weight = float(action_loss_weights.get("eef_position", 1.0))
+                quaternion_weight = float(action_loss_weights.get("eef_quaternion", 1.0))
+                hand_weight = float(action_loss_weights.get("hand", 1.0))
+                dimension_weights = torch.full(
+                    (36,), hand_weight, device=pred_actions.device, dtype=pred_actions.dtype
+                )
+                dimension_weights[0:3] = position_weight
+                dimension_weights[3:7] = quaternion_weight
+                dimension_weights[18:21] = position_weight
+                dimension_weights[21:25] = quaternion_weight
             action_loss_per_sample = compute_masked_action_l1_loss(
                 pred_actions,
                 actions_target,
                 action_valid_mask,
+                dimension_weights=dimension_weights,
             )
             action_loss = action_loss_per_sample.mean()
 

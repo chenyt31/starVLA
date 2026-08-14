@@ -4,6 +4,7 @@
 # Modified by [Jinhui YE/ HKUST University] in [2025]. 
 # Modification: [suport topdowm processing, suport param from config].
 
+import copy
 import logging
 from pathlib import Path
 from typing import Sequence
@@ -60,7 +61,20 @@ def make_LeRobotSingleDataset(
     :return: A LeRobotSingleDataset object.
     """
     
-    data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    # Registry entries are shared instances.  Copy before applying a per-run
+    # action-horizon override so no run changes another embodiment's default.
+    data_config = copy.deepcopy(ROBOT_TYPE_CONFIG_MAP[robot_type])
+    requested_horizon = data_cfg.get("action_horizon", None) if data_cfg else None
+    if requested_horizon is not None:
+        requested_horizon = int(requested_horizon)
+        if requested_horizon < 1:
+            raise ValueError(f"action_horizon must be positive, got {requested_horizon}")
+        if not hasattr(data_config, "action_indices"):
+            raise ValueError(
+                f"robot_type={robot_type!r} does not expose action_indices; "
+                "cannot apply datasets.vla_data.action_horizon"
+            )
+        data_config.action_indices = list(range(requested_horizon))
     modality_config = data_config.modality_config()
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name

@@ -119,6 +119,15 @@ class EgoS2TrainingComponentsTest(unittest.TestCase):
         loss = compute_masked_action_l1_loss(predictions, targets, mask)
         self.assertAlmostEqual(loss.item(), 2.0)
 
+    def test_masked_loss_applies_dimension_weights(self):
+        predictions = torch.tensor([[[1.0, 3.0]]])
+        targets = torch.zeros_like(predictions)
+        mask = torch.tensor([[1.0]])
+        loss = compute_masked_action_l1_loss(
+            predictions, targets, mask, dimension_weights=torch.tensor([3.0, 1.0])
+        )
+        self.assertAlmostEqual(loss.item(), 1.5)
+
     def test_loss_spike_and_overfit_reports_include_sample_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
