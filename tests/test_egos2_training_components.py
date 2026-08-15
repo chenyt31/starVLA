@@ -14,6 +14,7 @@ from starVLA.dataloader.gr00t_lerobot.augmentations import (
 )
 from starVLA.dataloader.gr00t_lerobot.datasets import compute_action_valid_mask
 from starVLA.dataloader.lerobot_datasets import OverfitSampler
+from starVLA.model.framework.VLM4A.QwenOFT import Qwenvl_OFT
 from starVLA.training.trainer_utils.action_loss import compute_masked_action_l1_loss
 from starVLA.training.trainer_utils.loss_diagnostics import (
     LossSpikeTracker,
@@ -127,6 +128,36 @@ class EgoS2TrainingComponentsTest(unittest.TestCase):
             predictions, targets, mask, dimension_weights=torch.tensor([3.0, 1.0])
         )
         self.assertAlmostEqual(loss.item(), 1.5)
+
+    def test_qwen_oft_matches_complete_multitoken_action_markers(self):
+        # Qwen3.5 tokenizes 🔍 into multiple ids.  The query extractor must
+        # match complete marker spans rather than treating the first id as a
+        # standalone action token.
+        model = Qwenvl_OFT.__new__(Qwenvl_OFT)
+        model.chunk_len = 4
+        input_ids = torch.tensor([
+            [101, 7, 8, 9, 5, 7, 8, 9, 6, 7, 8, 9, 7, 7, 8, 9, 4]
+        ])
+        last_hidden = torch.arange(input_ids.numel(), dtype=torch.float32).view(1, -1, 1)
+
+        queries = model._gather_action_token_embeddings(
+            last_hidden,
+            input_ids,
+            action_token_id=[7, 8, 9],
+        )
+
+        # The four complete markers end at positions 3, 7, 11 and 15.
+        torch.testing.assert_close(queries.flatten(), torch.tensor([3., 7., 11., 15.]))
+
+    def test_qwen_oft_rejects_incomplete_multitoken_action_markers(self):
+        model = Qwenvl_OFT.__new__(Qwenvl_OFT)
+        model.chunk_len = 2
+        with self.assertRaisesRegex(RuntimeError, "Insufficient complete action markers"):
+            model._gather_action_token_embeddings(
+                torch.zeros(1, 4, 2),
+                torch.tensor([[7, 8, 7, 99]]),
+                action_token_id=[7, 8, 9],
+            )
 
     def test_loss_spike_and_overfit_reports_include_sample_identity(self):
         with tempfile.TemporaryDirectory() as directory:

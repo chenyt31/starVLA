@@ -2469,6 +2469,19 @@ class LeRobotMixtureDataset(Dataset):
             self._primary_dataset_indices = np.zeros(len(self.datasets), dtype=bool)
             self._primary_dataset_indices[0] = True
 
+        # In eval/overfit mode, a logical index must identify a stable
+        # physical sample.  The train path intentionally samples a random
+        # dataset/trajectory/step, but reusing that path for overfit causes
+        # collisions (and leaves part of a tiny dataset unseen).  Keep a
+        # deterministic flat view for the fixed-sample diagnostic path.
+        self._eval_steps: list[tuple[LeRobotSingleDataset, int, int]] = []
+        if self.mode != "train":
+            for dataset in self.datasets:
+                self._eval_steps.extend(
+                    (dataset, int(trajectory_id), int(base_index))
+                    for trajectory_id, base_index in dataset.all_steps
+                )
+
         # Set the epoch and sample the first epoch
         self.set_epoch(0)
 
@@ -2518,6 +2531,9 @@ class LeRobotMixtureDataset(Dataset):
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""
         # return self.sampled_steps[index]
+
+        if self.mode != "train" and self._eval_steps:
+            return self._eval_steps[int(index) % len(self._eval_steps)]
 
         # Set seed
         seed = index if self.mode != "train" else safe_hash((self.epoch, index, self.seed))

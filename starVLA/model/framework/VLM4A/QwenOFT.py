@@ -125,6 +125,26 @@ class Qwenvl_OFT(baseframework):
         self.config.framework.action_model.action_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
         self.action_model = get_action_model(config=self.config)
 
+        # EgoS2 provides a normalized 36-D proprioceptive state.  The old
+        # path only rendered it as 256-bin text, which is lossy for a tiny
+        # memorization/regression set and makes neighboring frames nearly
+        # indistinguishable to the action head.  Keep the text conditioning
+        # for compatibility, and optionally add a small continuous state
+        # projection to every action query.  The module is opt-in so old
+        # checkpoints without this state_dict branch remain loadable.
+        action_model_cfg = self.config.framework.action_model
+        state_dim = int(action_model_cfg.get("state_dim", 0) or 0)
+        self.use_state_conditioning = bool(
+            action_model_cfg.get("use_state_conditioning", False)
+        ) and state_dim > 0
+        if self.use_state_conditioning:
+            self.state_projector = nn.Sequential(
+                nn.LayerNorm(state_dim),
+                nn.Linear(state_dim, int(action_model_cfg.action_hidden_dim)),
+            )
+        else:
+            self.state_projector = None
+
         # `action_horizon` is the single source of truth for chunk length.
         # Legacy aliases (`future_action_window_size`, `past_action_window_size`)
         # are normalised upstream by `share_tools.apply_config_compat`, so we
@@ -146,8 +166,28 @@ class Qwenvl_OFT(baseframework):
             else ()
         )
 
-        self.action_token = "🔍"  # TODO also can add spacail token to Qwen, but too complex
-        self.action_token_id = self.qwen_vl_interface.processor.tokenizer("🔍", add_special_tokens=False)["input_ids"][0]
+        self.action_token = "🔍"
+        action_token_ids = self.qwen_vl_interface.processor.tokenizer(
+            self.action_token,
+            add_special_tokens=False,
+        )["input_ids"]
+        if not action_token_ids:
+            raise RuntimeError(
+                f"Action marker {self.action_token!r} produced no tokenizer ids for "
+                f"{self.qwen_vl_interface.__class__.__name__}."
+            )
+        # Some tokenizers encode the marker as one id (Qwen2.5/Qwen3), while
+        # others encode it as several ids (Qwen3.5).  Keep the complete
+        # sequence; extracting only the first id silently creates the wrong
+        # number/position of action queries.
+        self.action_token_ids = tuple(int(token_id) for token_id in action_token_ids)
+        # Keep the singular attribute for callers that inspect it.  The
+        # gather helper below accepts either an int or a full id sequence.
+        self.action_token_id = (
+            self.action_token_ids[0]
+            if len(self.action_token_ids) == 1
+            else self.action_token_ids
+        )
 
         # L1 loss
         # Keep the unreduced loss so the trainer can identify the physical
@@ -215,8 +255,9 @@ class Qwenvl_OFT(baseframework):
             # Extract action token embeddings as action prediction queries
             input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
-                last_hidden, input_ids, action_token_id=self.action_token_id
+                last_hidden, input_ids, action_token_id=self.action_token_ids
             )  # [B, chunk_len, H]
+            action_queries = self._add_continuous_state_condition(action_queries, state)
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
             pred_actions = self._project_unit_quaternions(
                 pred_actions, self._unit_quaternion_slices
@@ -324,8 +365,9 @@ class Qwenvl_OFT(baseframework):
             # Extract action token embeddings as action prediction queries
             input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
-                last_hidden, input_ids, action_token_id=self.action_token_id
+                last_hidden, input_ids, action_token_id=self.action_token_ids
             )  # [B, chunk_len, H]
+            action_queries = self._add_continuous_state_condition(action_queries, state)
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
             pred_actions = self._project_unit_quaternions(
                 pred_actions, self._unit_quaternion_slices
@@ -373,6 +415,43 @@ class Qwenvl_OFT(baseframework):
 
         return projected
 
+    def _add_continuous_state_condition(
+        self,
+        action_queries: torch.Tensor,
+        state: List[np.ndarray] | None,
+    ) -> torch.Tensor:
+        """Add the optional continuous proprioceptive state embedding.
+
+        The dataloader packs one state observation as ``[1, state_dim]`` per
+        example.  Only the observation at the current frame is used; the
+        action horizon remains represented by the separate causal marker
+        queries.  Returning the original tensor when disabled keeps the
+        legacy QwenOFT graph and checkpoint behavior unchanged.
+        """
+        if not self.use_state_conditioning or self.state_projector is None or state is None:
+            return action_queries
+
+        state_tensor = torch.as_tensor(
+            np.asarray(state),
+            device=action_queries.device,
+            dtype=torch.float32,
+        )
+        if state_tensor.ndim == 3 and state_tensor.shape[1] == 1:
+            state_tensor = state_tensor[:, 0, :]
+        elif state_tensor.ndim != 2:
+            raise ValueError(
+                "Expected state shaped [B, 1, state_dim] or [B, state_dim], got "
+                f"{tuple(state_tensor.shape)}"
+            )
+
+        projected = self.state_projector(state_tensor)
+        if projected.shape[0] != action_queries.shape[0] or projected.shape[-1] != action_queries.shape[-1]:
+            raise ValueError(
+                "Continuous state projection shape does not match action queries: "
+                f"projection={tuple(projected.shape)}, queries={tuple(action_queries.shape)}"
+            )
+        return action_queries + projected.to(dtype=action_queries.dtype).unsqueeze(1)
+
     def _gather_action_token_embeddings(
         self,
         last_hidden: torch.Tensor,  # [B, L, H]
@@ -380,9 +459,13 @@ class Qwenvl_OFT(baseframework):
         action_token_id=None,  # Can be int or List[int]
     ) -> torch.Tensor:
         """
-        Vectorized batch extraction of action token embeddings:
-          - No per-sample for loop
-          - Select the last chunk_len action placeholder tokens from each sample
+        Extract one hidden state per complete action marker.
+
+        The marker may be encoded as one tokenizer id or as a sequence of
+        ids.  Matching the complete sequence is important: matching only the
+        first id can accidentally select a sub-token and makes the query
+        count depend on the tokenizer.  For a multi-id marker, use the final
+        marker position so its hidden state has seen the complete marker.
         Args:
             last_hidden: [B, L, H]
             input_ids:   [B, L]
@@ -393,39 +476,86 @@ class Qwenvl_OFT(baseframework):
         if action_token_id is None:
             raise ValueError("action_token_id must not be None")
 
-        device = input_ids.device
-        B, L, H = last_hidden.shape
-
-        # Support multiple ids (e.g., multiple variants)
-        if isinstance(action_token_id, (list, tuple, set)):
-            id_list = torch.tensor(list(action_token_id), device=device, dtype=input_ids.dtype)
-            # torch.isin requires PyTorch >=1.10
-            mask = torch.isin(input_ids, id_list)
-        else:
-            mask = input_ids == action_token_id  # [B, L]
-
-        counts = mask.sum(dim=1)  # [B]
-        if (counts < self.chunk_len).any():
-            insufficient = (counts < self.chunk_len).nonzero(as_tuple=False).flatten().tolist()
-            raise RuntimeError(
-                f"The following samples have insufficient action tokens (< {self.chunk_len}): {insufficient} |"
-                f" counts={counts.tolist()}"
+        if input_ids is None:
+            raise RuntimeError("QwenOFT requires input_ids to locate action markers.")
+        if last_hidden.ndim != 3 or input_ids.ndim != 2:
+            raise ValueError(
+                "Expected last_hidden [B, L, H] and input_ids [B, L], got "
+                f"{tuple(last_hidden.shape)} and {tuple(input_ids.shape)}"
             )
 
-        # Position indices
-        idx = torch.arange(L, device=device).unsqueeze(0).expand(B, L)  # [B, L]
-        masked_pos = torch.where(mask, idx, torch.full_like(idx, -1))  # Set non-action positions to -1
+        device = input_ids.device
+        batch_size, seq_len, hidden_size = last_hidden.shape
+        if input_ids.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                "last_hidden and input_ids must have the same [B, L], got "
+                f"{tuple(last_hidden.shape[:2])} and {tuple(input_ids.shape)}"
+            )
 
-        # Take the last chunk_len positions (higher indices = later in sequence)
-        # Note: count sufficiency already verified, so -1 won't be incorrectly selected
-        topk_pos = masked_pos.topk(k=self.chunk_len, dim=-1).values  # [B, chunk_len] unsorted
-        # Sort in temporal order
-        selected_pos = topk_pos.sort(dim=-1).values  # [B, chunk_len]
+        if isinstance(action_token_id, torch.Tensor):
+            marker_ids = [int(token_id) for token_id in action_token_id.reshape(-1).tolist()]
+        elif isinstance(action_token_id, set):
+            marker_ids = [int(token_id) for token_id in sorted(action_token_id)]
+        elif isinstance(action_token_id, (list, tuple)):
+            marker_ids = [int(token_id) for token_id in action_token_id]
+        else:
+            marker_ids = [int(action_token_id)]
+        if not marker_ids:
+            raise ValueError("action_token_id must contain at least one tokenizer id")
 
-        # Gather
-        expanded_index = selected_pos.unsqueeze(-1).expand(-1, -1, H)  # [B, chunk_len, H]
-        action_queries = last_hidden.gather(dim=1, index=expanded_index)  # [B, chunk_len, H]
-        return action_queries
+        marker = torch.tensor(marker_ids, device=device, dtype=input_ids.dtype)
+        marker_len = len(marker_ids)
+        if marker_len == 1:
+            marker_starts = input_ids.eq(marker[0]).nonzero(as_tuple=False)
+            matches_by_row = [
+                marker_starts[marker_starts[:, 0] == row, 1]
+                for row in range(batch_size)
+            ]
+        else:
+            if seq_len < marker_len:
+                matches_by_row = [torch.empty(0, device=device, dtype=torch.long)] * batch_size
+            else:
+                windows = input_ids.unfold(1, marker_len, 1)
+                match_mask = windows.eq(marker.view(1, 1, -1)).all(dim=-1)
+                matches_by_row = [
+                    match_mask[row].nonzero(as_tuple=False).flatten()
+                    for row in range(batch_size)
+                ]
+
+        selected_positions = []
+        for row, starts in enumerate(matches_by_row):
+            # Match spans must not overlap.  This also makes the behavior
+            # deterministic if a future tokenizer emits a self-overlapping
+            # marker sequence.
+            selected_starts = []
+            next_available_start = 0
+            for start in starts.tolist():
+                if start >= next_available_start:
+                    selected_starts.append(start)
+                    next_available_start = start + marker_len
+
+            if len(selected_starts) < self.chunk_len:
+                raise RuntimeError(
+                    "Insufficient complete action markers: "
+                    f"sample={row}, required={self.chunk_len}, "
+                    f"found={len(selected_starts)}, marker_ids={marker_ids}"
+                )
+
+            # Keep the final chunk_len markers, matching the previous
+            # behavior when an instruction contains an incidental marker.
+            selected_starts = selected_starts[-self.chunk_len :]
+            # Use the final id of each marker as the query position.
+            selected_positions.append(
+                torch.tensor(
+                    [start + marker_len - 1 for start in selected_starts],
+                    device=device,
+                    dtype=torch.long,
+                )
+            )
+
+        selected_pos = torch.stack(selected_positions, dim=0)
+        expanded_index = selected_pos.unsqueeze(-1).expand(-1, -1, hidden_size)
+        return last_hidden.gather(dim=1, index=expanded_index)
 
     # Discretised state → instruction prefix (π₀.5 style); shared with QwenPI_v3.
     add_discretized_state_to_instruction = staticmethod(add_discretized_state_to_instruction)

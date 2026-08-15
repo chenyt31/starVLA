@@ -66,6 +66,36 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = get_logger(__name__)
 
 
+def atomic_save_model_state(state_dict, target_path: str, save_format: str) -> None:
+    """Write a model state atomically and remove failed partial files.
+
+    Large checkpoints are particularly vulnerable to leaving a truncated
+    ``.pt`` file when the filesystem runs out of space or an I/O error occurs.
+    Save to a run-specific temporary sibling first, then publish it with
+    ``os.replace`` only after serialization completes.
+    """
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+    try:
+        if save_format == "safetensors":
+            from safetensors.torch import save_file
+
+            save_file(state_dict, str(temporary))
+        elif save_format == "pt":
+            torch.save(state_dict, str(temporary))
+        else:
+            raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+        os.replace(temporary, target)
+    finally:
+        # If serialization failed (e.g. ENOSPC/basic_ios), never leave a
+        # truncated artifact that a later resume would mistake for valid.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def load_fast_tokenizer():
     return AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
 
@@ -288,14 +318,8 @@ class VLATrainer(TrainerUtils):
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
             state_dict = self.accelerator.get_state_dict(self.model)
-            if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
-            elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-            else:
-                raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            suffix = "_model.safetensors" if save_format == "safetensors" else "_pytorch_model.pt"
+            atomic_save_model_state(state_dict, checkpoint_path + suffix, save_format)
 
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
@@ -473,14 +497,12 @@ class VLATrainer(TrainerUtils):
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
             state_dict = self.accelerator.get_state_dict(self.model)
-            if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
-            elif save_format == "pt":
-                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
-            else:
-                raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            final_name = "model.safetensors" if save_format == "safetensors" else "pytorch_model.pt"
+            atomic_save_model_state(
+                state_dict,
+                os.path.join(final_checkpoint, final_name),
+                save_format,
+            )
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):

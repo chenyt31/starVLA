@@ -15,6 +15,7 @@ framework:
     action_model_type: MLP
     action_dim: 36
     state_dim: 36
+    use_state_conditioning: true
     action_horizon: 8
 
 datasets:
