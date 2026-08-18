@@ -35,7 +35,7 @@ except ImportError:
 import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -49,14 +49,21 @@ from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, w
 from starVLA.training.trainer_utils.loss_diagnostics import LossSpikeTracker, OverfitAnalyzer
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
+ddp_kwargs_handlers = []
+if os.environ.get("STARVLA_DDP_FIND_UNUSED_PARAMETERS", "").lower() in {"1", "true", "yes"}:
+    # QwenPI consumes Qwen hidden states but not every Qwen output head.  In
+    # full-parameter DDP training those intentionally unused parameters must
+    # be identified so the reducer can complete each iteration.
+    ddp_kwargs_handlers.append(DistributedDataParallelKwargs(find_unused_parameters=True))
+
 if importlib.util.find_spec("deepspeed") is None:
     # DeepSpeed is an optional acceleration path.  Keep single-GPU training
     # usable in the lightweight CUDA environment used by EgoS2 smoke tests.
     deepspeed_plugin = None
-    accelerator = Accelerator()
+    accelerator = Accelerator(kwargs_handlers=ddp_kwargs_handlers)
 else:
     deepspeed_plugin = DeepSpeedPlugin()
-    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+    accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, kwargs_handlers=ddp_kwargs_handlers)
 accelerator.print(accelerator.state)
 
 # Sane Defaults

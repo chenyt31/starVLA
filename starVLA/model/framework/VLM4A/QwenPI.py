@@ -201,6 +201,11 @@ class Qwen_PI(baseframework):
         batch_images = [example["image"] for example in examples]  #  [B, [PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B, len, 7]
+        action_valid_mask = (
+            [example["action_valid_mask"] for example in examples]
+            if "action_valid_mask" in examples[0]
+            else None
+        )
 
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
 
@@ -215,6 +220,10 @@ class Qwen_PI(baseframework):
                 np.array(actions), device=base_hidden.device, dtype=base_hidden.dtype
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+            if action_valid_mask is not None:
+                action_valid_mask = torch.tensor(
+                    np.array(action_valid_mask), device=base_hidden.device, dtype=base_hidden.dtype
+                )[:, -self.action_horizon :]
 
             repeated_diffusion_steps = (
                 self.config.framework.action_model.get("repeated_diffusion_steps", 4)
@@ -223,6 +232,11 @@ class Qwen_PI(baseframework):
             )
             repeated_diffusion_steps = 2  # NO repeat for big action FM
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
+            action_valid_mask_repeated = (
+                action_valid_mask.repeat(repeated_diffusion_steps, 1)
+                if action_valid_mask is not None
+                else None
+            )
             # Repeat features for each layer
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]
             if backbone_attention_mask is not None:
@@ -240,6 +254,7 @@ class Qwen_PI(baseframework):
                 actions_target_repeated,
                 state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
+                action_valid_mask=action_valid_mask_repeated,
             )  # (B, chunk_len, action_dim)
 
         return {"action_loss": action_loss}
